@@ -64,6 +64,7 @@ class SequenceLoader():
     self._label_prefix = "labels_"
     self._num_frames = meta['num_frames']
     self._ycb_ids = meta['ycb_ids']
+    self._ycb_grasp_ind = meta['ycb_grasp_ind']
     self._mano_sides = meta['mano_sides']
 
     # Load intrinsics.
@@ -161,7 +162,8 @@ class SequenceLoader():
       ]
 
     # Create YCB group layer.
-    self._ycb_group_layer = YCBGroupLayer(self._ycb_ids).to(self._device)
+    ycb_grasp_id = self._ycb_ids[self._ycb_grasp_ind]
+    self._ycb_group_layer = YCBGroupLayer([ycb_grasp_id]).to(self._device)
 
     self._ycb_model_dir = self._dex_ycb_dir + "/models"
     self._ycb_count = self._ycb_group_layer.count
