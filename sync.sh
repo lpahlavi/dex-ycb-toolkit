@@ -12,7 +12,7 @@ function display_help() {
     echo "              * server3 | ait-server-03"
     echo "              * leonhard"
     echo "              * cnb-workstation"
-    echo "              * ait-workstation"
+    echo "              * std-workstation"
     echo ""
     echo "Options:"
     echo "    -h --help         Show this help message."
