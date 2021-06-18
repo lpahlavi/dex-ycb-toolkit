@@ -26,6 +26,7 @@ class SequenceLoader():
       device='cuda:0',
       preload=True,
       app='viewer',
+      verbose=False,
   ):
     """Constructor.
 
@@ -43,6 +44,7 @@ class SequenceLoader():
     self._device = torch.device(device)
     self._preload = preload
     self._app = app
+    self._verbose = verbose
 
     assert 'DEX_YCB_DIR' in os.environ, "environment variable 'DEX_YCB_DIR' is not set"
     self._dex_ycb_dir = os.environ['DEX_YCB_DIR']
@@ -64,8 +66,8 @@ class SequenceLoader():
     self._label_prefix = "labels_"
     self._num_frames = meta['num_frames']
     self._ycb_ids = meta['ycb_ids']
-    self._ycb_grasp_ind = meta['ycb_grasp_ind']
     self._mano_sides = meta['mano_sides']
+    self._ycb_grasp_id = self._ycb_ids[meta['ycb_grasp_ind']]
 
     # Load intrinsics.
     def intr_to_K(x):
@@ -125,7 +127,8 @@ class SequenceLoader():
 
     # Load point cloud.
     if self._preload:
-      print('Preloading point cloud')
+      if self._verbose:
+        print('Preloading point cloud')
       self._color = []
       self._depth = []
       for c in range(self._num_cameras):
@@ -147,7 +150,8 @@ class SequenceLoader():
         self._pcd_vert.append(p)
         self._pcd_mask.append(m)
     else:
-      print('Loading point cloud online')
+      if self._verbose:
+        print('Loading point cloud online')
       self._pcd_rgb = [
           np.zeros((self._h, self._w, 3), dtype=np.uint8)
           for _ in range(self._num_cameras)
@@ -162,8 +166,7 @@ class SequenceLoader():
       ]
 
     # Create YCB group layer.
-    ycb_grasp_id = self._ycb_ids[self._ycb_grasp_ind]
-    self._ycb_group_layer = YCBGroupLayer([ycb_grasp_id]).to(self._device)
+    self._ycb_group_layer = YCBGroupLayer(self._ycb_ids).to(self._device)
 
     self._ycb_model_dir = self._dex_ycb_dir + "/models"
     self._ycb_count = self._ycb_group_layer.count

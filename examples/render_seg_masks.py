@@ -5,12 +5,18 @@
 """Example of rendering a sequence."""
 
 import argparse
-import torch
-import pyrender
-import trimesh
 import os
-import numpy as np
+
 import cv2
+import glob
+import igl
+import numpy as np
+import pandas as pd
+import pyrender
+import torch
+import trimesh
+from tqdm import tqdm
+from tqdm import trange
 
 from dex_ycb_toolkit.sequence_loader import SequenceLoader
 from dex_ycb_toolkit.mesh_intersection import intersection_eval
@@ -45,10 +51,6 @@ _YCB_SEG_VALUES = {
 def parse_args():
   parser = argparse.ArgumentParser(
       description='Render hand & object poses in camera views.')
-  parser.add_argument('--name',
-                      help='Name of the sequence',
-                      default=None,
-                      type=str)
   parser.add_argument('--device',
                       help='Device for data loader computation',
                       default='cuda:0',
@@ -137,93 +139,123 @@ class Renderer():
 
   def _render_seg(self):
     """Renders segmentation masks."""
-    print('Rendering segmentation masks')
-    for i in range(self._loader.num_frames):
-      print('{:03d}/{:03d}'.format(i + 1, self._loader.num_frames))
+    metainfo = []
 
+    for i in trange(self._loader.num_frames, leave=False, desc="Frames"):
       self._loader.step()
-
-      # DEBUGGING!
-      if i < 20:
-        continue
-      if i > 25:
-        break
-
       for c in range(self._loader.num_cameras):
+
+        # Create pyrender scene.
+        scene = pyrender.Scene(bg_color=np.array([0.0, 0.0, 0.0, 0.0]),
+                               ambient_light=np.array([1.0, 1.0, 1.0]))
+
+        # Add camera.
+        scene.add(self._cameras[c], pose=np.eye(4))
+
+        seg_node_map = {}
 
         pose_y = self._loader.ycb_pose[c]
         vert_m = self._loader.mano_vert[c]
 
-        # Render YCB meshes.
-        if (self._loader.num_ycb == 0) or np.all(pose_y[0] == 0.0):
-          has_object = False
-        else:
-          pose = pose_y[0].copy()
+        # Add YCB meshes.
+        grasped_object_node = None
+        grasped_object_pose = None
+
+        for o in range(self._loader.num_ycb):
+          if np.all(pose_y[o] == 0.0):
+            continue
+          pose = pose_y[o].copy()
           pose[1] *= -1
           pose[2] *= -1
+          node = scene.add(self._mesh_y[o], pose=pose)
+          seg_node_map.update({node: (_YCB_SEG_VALUES[self._loader.ycb_ids[o]],) * 3})
 
-          object_mask = self._render_mesh(self._mesh_y[0], c, pose=pose)
-          object_mask[object_mask.astype(bool)] = _YCB_SEG_VALUES[self._loader.ycb_ids[0]]
+          if self._loader.ycb_ids[o] == self._loader._ycb_grasp_id:
+            grasped_object_mesh = node.mesh
+            grasped_object_pose = pose
 
-          object_trimesh = self._trimesh_y[0]
-          object_trimesh.apply_transform(pose)
+        # Add MANO meshes.
+        hand_meshs = []
+        for o in range(self._loader.num_mano):
+          if np.all(vert_m[o] == 0.0):
+            continue
+          vert = vert_m[o].copy()
+          vert[:, 1] *= -1
+          vert[:, 2] *= -1
+          mesh = trimesh.Trimesh(vertices=vert, faces=self._faces)
+          mesh = pyrender.Mesh.from_trimesh(mesh)
+          node = scene.add(mesh)
+          seg_node_map.update({node: (_MANO_SEG_VALUE,) * 3})
+          hand_meshs.append(mesh)
 
-          has_object = True
-          
-        # Render MANO meshes.
-        if (self._loader.num_mano == 0):
-          has_hand = False
-        else:
-          w, h = self._loader.dimensions
-          hand_mask = np.zeros((h, w), dtype=np.uint8)
-          hand_trimesh = None
+        # Render raw mask (with all YCB objects)
+        seg_mask, _ = self._r.render(
+          scene, pyrender.RenderFlags.SEG, seg_node_map=seg_node_map
+        )
 
-          for o in range(self._loader.num_mano):
-            
-            if np.all(vert_m[o] == 0.0):
-              continue
-            
-            vert = vert_m[o].copy()
-            vert[:, 1] *= -1
-            vert[:, 2] *= -1
-            
-            this_hand_trimesh = trimesh.Trimesh(vertices=vert, faces=self._faces)
-            
-            mesh = pyrender.Mesh.from_trimesh(this_hand_trimesh)
-            hand_mask += self._render_mesh(mesh, c)
+        # Keep only one of the channels and copy since the rendered mask is immutable
+        seg_mask = seg_mask[:, :, 0].copy()
 
-            if hand_trimesh is None:
-              hand_trimesh = this_hand_trimesh
-            else:
-              hand_trimesh = hand_trimesh.union(this_hand_trimesh)
+        # Erase background objects and set grasped object pixel values to 2
+        is_hand = (seg_mask == _MANO_SEG_VALUE)
+        is_grasped_object = (seg_mask == _YCB_SEG_VALUES[self._loader._ycb_grasp_id])
+        is_background = ~(is_hand | is_grasped_object)
 
-          hand_mask[hand_mask.astype(bool)] = _MANO_SEG_VALUE
-          has_hand = bool(np.any(hand_mask))
+        seg_mask[is_background] = 0
+        seg_mask[is_hand] = 1
+        seg_mask[is_grasped_object] = 2
 
-        # Determine if there is contact between hand and object
-        if has_hand and has_object:
-          _, mesh_mesh_distance = intersection_eval(hand_trimesh, object_trimesh, res=0.001)
-          object_is_grasped = True
-          print(f"hand-object distance: {mesh_mesh_distance}cm")
-        else:
-          object_is_grasped = False
-
-        # Construct segmentation mask
-        seg_mask = np.zeros((h, w), dtype=np.uint8)
-        if has_hand is True:
-          np.putmask(seg_mask, hand_mask.astype(bool), hand_mask)
-        if object_is_grasped is True:
-          np.putmask(seg_mask, object_mask.astype(bool), object_mask)
-
-        # # For some reason, there are often several pixels that have non-zero values in
-        # # the background. Take care of these here.
-        # mano_value = _MANO_SEG_VALUE[0]
-        # grasped_ycb_value = _YCB_SEG_VALUES[self._loader.ycb_ids[0]][0]
-        # is_garbage = (seg_masks != mano_value) & (seg_masks != grasped_ycb_value)
-        # seg_masks[is_garbage] = 0
-
+        # Save segmentation mask as png (lossless compression!)
         seg_file = self._render_dir[c] + "/seg_{:06d}.png".format(i)
         cv2.imwrite(seg_file, seg_mask)
+
+      # Compute hand-object distance (only for a single camera angle)
+      def transform(matrix, vertices):
+          """ Apply homogeneous transformation to array of 3D points"""
+          n, _ = vertices.shape
+          vertices = np.hstack([vertices, np.ones((n,1), vertices.dtype)])
+          vertices = (matrix @ vertices.T).T
+          return vertices[:,:3]
+
+      if (grasped_object_mesh is not None) and (hand_meshs != []):
+        mesh_mesh_distance = np.inf
+
+        # Compute world coordinates of object mesh vertices
+        object_primitive = grasped_object_mesh.primitives[0]
+        object_faces = object_primitive.indices.astype(np.int32)
+        object_vertices = transform(grasped_object_pose, object_primitive.positions)
+
+        for hand_mesh in hand_meshs:
+
+          # Compute distance between current hand and object
+          hand_primitive = hand_mesh.primitives[0]
+          hand_vertices = hand_primitive.positions + 1e-10
+
+          # Compute smallest mesh-mesh distance
+          smallest_signed_distances, _, _ = igl.signed_distance(
+            hand_vertices, object_vertices, object_faces, return_normals=False
+          )
+          mesh_mesh_distance = min(mesh_mesh_distance, smallest_signed_distances.min())
+
+      else:
+        mesh_mesh_distance = np.nan
+
+      # Save meta info for this sequence and camera angle
+      subject, sequence = self._name.split("/")
+      metainfo.append({
+        "subject": subject,
+        "sequence": sequence,
+        "frame": i,
+        "num_mano_hands": self._loader.num_mano,
+        "grasped_object_ycb_index": self._loader._ycb_grasp_id,
+        "hand_object_distance": mesh_mesh_distance,
+      })
+
+    # Save meta info for this sequence (in the 'data' directory, together with the
+    # rendered segmentation masks)
+    metainfo = pd.DataFrame(metainfo)
+    metainfo.to_csv(os.path.join(os.path.dirname(renderer._render_dir[c]), "meta.csv"))
+      
 
   def run(self):
     """Runs the renderer."""
@@ -233,5 +265,18 @@ class Renderer():
 if __name__ == '__main__':
   args = parse_args()
 
-  renderer = Renderer(args.name, args.device)
-  renderer.run()
+  # Find all sequences
+  sequence_paths = os.path.join(os.environ["DEX_YCB_DIR"], "*-subject-*", "*")
+  sequence_paths = glob.glob(sequence_paths, recursive=True)
+  sequence_names = [os.sep.join(path.split(os.sep)[-2:]) for path in sequence_paths]
+
+  # Render each sequence sequentially since we only have a single GPU
+  t = tqdm(sequence_names)
+  for sequence_name in t:
+    t.set_description(sequence_name, refresh=True)
+    renderer = Renderer(sequence_name, args.device)
+    renderer.run()
+
+  print("All done!")
+
+  
